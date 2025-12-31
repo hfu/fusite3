@@ -32,7 +32,6 @@
                 <option value="gsi">最適化ベクトルタイル</option>
                 <option value="gsi-ortho">シームレス写真</option>
                 <option value="contour">等高線</option>
-                <option value="lineage">元データ</option>
                 <option value="multidirectional">多重光源</option>
             </select>
         </div>
@@ -49,7 +48,7 @@
     <script type="text/javascript">
         /**
          * Parse URL fragment parameters
-         * Format: #map=z/lat/lng&theme=yyy
+         * Format: #map=z/lat/lng/pitch/bearing&theme=yyy&exag=xxx
          */
         function parseHashParams() {
             const hash = window.location.hash.substring(1);
@@ -177,7 +176,6 @@
                 'contour': 'Terrarium 標高タイルから動的に等高線を生成',
                 'gsi': 'Mapterhorn の標高データと国土地理院の基盤地図を表示',
                 'gsi-ortho': 'Mapterhorn の標高データと国土地理院のシームレス写真を表示',
-                'lineage': '地形に対応した Lineage 画像タイルを表示',
                 'multidirectional': '複数の光源方向による多重光源陰影を表示',
                 'osm': 'Mapterhorn Terrarium 形式で標高データを可視化'
             };
@@ -247,31 +245,6 @@
                 return buildContourStyle(style, terrainTiles[0]);
             } else if (theme === 'multidirectional') {
                 return buildMultidirectionalStyle(style);
-            } else if (theme === 'lineage') {
-                // For lineage theme, we'll use the same terrain tiles for imagery
-                style.sources.lineage = {
-                    type: 'raster',
-                    tiles: terrainTiles,
-                    tileSize: 512,
-                    maxzoom: 16
-                };
-
-                style.layers = [
-                    getBackgroundLayer(),
-                    {
-                        id: 'lineage',
-                        type: 'raster',
-                        source: 'lineage',
-                        paint: {
-                            'raster-opacity': 1.0
-                        }
-                    },
-                    getHillshadeLayer()
-                ];
-
-                style.sky = getDefaultSkyConfig();
-
-                return style;
             }
 
             // Default to osm
@@ -671,7 +644,7 @@
                     this._container.innerHTML = `
                         <div class="terrain-exaggeration">
                             <label for="terrain-slider">地形強調: <span id="terrain-value">${this._initialValue.toFixed(1)}</span>x</label>
-                            <input type="range" id="terrain-slider" min="0" max="3" step="0.1" value="${this._initialValue}">
+                            <input type="range" id="terrain-slider" min="0" max="3" step="0.1" value="${this._initialValue}" aria-label="地形強調スライダー" aria-valuemin="0" aria-valuemax="3" aria-valuenow="${this._initialValue}">
                         </div>
                     `;
 
@@ -681,6 +654,7 @@
                     slider.oninput = (e) => {
                         const value = parseFloat(e.target.value);
                         valueDisplay.textContent = value.toFixed(1);
+                        slider.setAttribute('aria-valuenow', value);
                         map.setTerrain({
                             source: 'terrainSource',
                             exaggeration: value
@@ -808,6 +782,15 @@
 
             // Update dropdown UI to reflect current params
             if (typeof themeSelect !== 'undefined' && themeSelect) themeSelect.value = theme;
+
+            // Update terrain slider UI to reflect current exaggeration
+            const slider = document.getElementById('terrain-slider');
+            const valueDisplay = document.getElementById('terrain-value');
+            if (slider && valueDisplay) {
+                slider.value = exag;
+                valueDisplay.textContent = exag.toFixed(1);
+                slider.setAttribute('aria-valuenow', exag);
+            }
 
             // Build and apply new style.
             // Note: `map.setStyle` replaces the current style (sources and

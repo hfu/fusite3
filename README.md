@@ -26,7 +26,6 @@
 - `gsi` — 国土地理院の最適化ベクトルタイル（bvmap-overdrive / MLT）を読み込み、行政区画や道路等のベクトル情報を重ねます。
 - `gsi-ortho` — 国土地理院のシームレス航空写真タイル（seamlessphoto）を背景に使用します。
 - `contour` — `maplibre-contour` を使って Terrarium 標高タイルから動的に等高線を生成します。
-- `lineage` — 地形に対応した Lineage 画像タイルを表示します。
 - `multidirectional` — 複数光源を用いた hillshade 表示（ハイライト/シャドウ色配列、光源方向、高度、強調度を調整可能）。
 
 ## URL フラグメントでの操作

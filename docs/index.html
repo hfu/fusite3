@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8" />
+    <title>fusite3 - 標高タイル可視化</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Mapterhorn Terrarium タイルによる標高データ可視化 - fusion 版" />
+
+    <!-- MapLibre GL JS (use modern 5.x release) -->
+    <script src="https://unpkg.com/maplibre-gl@^5.13.0/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@^5.13.0/dist/maplibre-gl.css" rel="stylesheet" />
+
+    <!-- maplibre-contour for contour theme -->
+    <script src="https://unpkg.com/maplibre-contour@0.0.5/dist/index.min.js"></script>
+
+    <link href="style.css" rel="stylesheet" />
+</head>
+
+<body class="has-info-toggle">
+    <div id="map"></div>
+
+    <button id="info-toggle" class="info-toggle" aria-expanded="false" aria-controls="info-panel" title="情報を開く">ℹ️</button>
+
+    <div id="info-panel" class="info-panel hidden" aria-hidden="true">
+        <h1>fusite3</h1>
+        <p id="info-description">Mapterhorn Terrarium 形式で標高データを可視化</p>
+        
+        <div class="control-group">
+            <label for="theme-select">テーマ:</label>
+            <select id="theme-select">
+                <option value="osm">OpenStreetMap</option>
+                <option value="gsi">最適化ベクトルタイル</option>
+                <option value="gsi-ortho">シームレス写真</option>
+                <option value="contour">等高線</option>
+                <option value="lineage">元データ</option>
+                <option value="multidirectional">多重光源</option>
+            </select>
+        </div>
+        
+        <p class="attribution">
+            データ: <a href="https://www.gsi.go.jp/" target="_blank" rel="noopener noreferrer">国土地理院 (GSI Japan)</a><br>
+            測量法に基づく国土地理院長承認(使用)R 7JHs 542<br>
+            <br>
+            Powered by <a href="https://mapterhorn.com/" target="_blank" rel="noopener noreferrer">Mapterhorn</a> by <a href="https://github.com/wipfli" target="_blank" rel="noopener noreferrer">Oliver Wipfli</a><br>
+            Made with <a href="https://github.com/hfu/fusite3" target="_blank" rel="noopener noreferrer">fusite3</a>
+        </p>
+    </div>
+
+    <script type="text/javascript">
+        /**
+         * Parse URL fragment parameters
+         * Format: #map=z/lat/lng&theme=yyy
+         */
+        function parseHashParams() {
+            const hash = window.location.hash.substring(1);
+            const params = {};
+
+            if (!hash) return params;
+
+            // Split by & and parse each parameter
+            hash.split('&').forEach(part => {
+                const [key, value] = part.split('=');
+                if (key && value !== undefined) {
+                    params[key] = value;
+                }
+            });
+
+            return params;
+        }
+
+        /**
+         * Update URL fragment without triggering hashchange.
+         *
+         * This uses `history.replaceState` to update only the fragment/hash
+         * without causing a navigation. Use this when you want the URL to
+         * reflect UI state but do not want to add a new history entry or
+         * trigger a `hashchange` navigation.
+         */
+        function updateHashParams(newParams) {
+            const currentParams = parseHashParams();
+            const mergedParams = { ...currentParams, ...newParams };
+
+            const hashParts = [];
+            for (const [key, value] of Object.entries(mergedParams)) {
+                if (value !== undefined && value !== null) {
+                    hashParts.push(`${key}=${value}`);
+                }
+            }
+
+            const newHash = hashParts.join('&');
+            if (window.location.hash.substring(1) !== newHash) {
+                history.replaceState(null, '', '#' + newHash);
+            }
+        }
+
+        // Parse initial parameters
+        let hashParams = parseHashParams();
+        let theme = hashParams.theme || 'osm';
+        let exag = parseFloat(hashParams.exag) || 1;
+
+        // Use Mapterhorn as the single terrain source
+        const MAPTERHORN_TILEJSON_URL = 'https://tiles.mapterhorn.com/tilejson.json';
+
+        // Global map reference so other functions can update the map dynamically
+        let map = null;
+
+        /**
+         * Common sky configuration for themes that display 3D terrain
+         */
+        function getDefaultSkyConfig() {
+            return {
+                'sky-color': '#87CEEB',
+                'sky-horizon-blend': 0.5,
+                'horizon-color': '#ffffff',
+                'horizon-fog-blend': 0.5,
+                'fog-color': '#ffffff',
+                'fog-ground-blend': 0.5
+            };
+        }
+
+        /**
+         * Common background layer configuration
+         */
+        function getBackgroundLayer() {
+            return {
+                id: 'background',
+                type: 'background',
+                paint: {
+                    'background-color': '#e0e0e0'
+                }
+            };
+        }
+
+        /**
+         * Common hillshade layer configuration
+         * @param {number} exaggeration - Hillshade exaggeration value (default: 0.3)
+         */
+        function getHillshadeLayer(exaggeration = 0.3) {
+            return {
+                id: 'hillshade',
+                type: 'hillshade',
+                source: 'hillshadeSource',
+                paint: {
+                    'hillshade-exaggeration': exaggeration,
+                    'hillshade-shadow-color': '#473B24'
+                }
+            };
+        }
+
+        /**
+         * GSI-style hillshade with highlight color
+         */
+        function getGsiHillshadeLayer() {
+            return {
+                id: 'hillshade',
+                type: 'hillshade',
+                source: 'hillshadeSource',
+                paint: {
+                    'hillshade-exaggeration': 0.4,
+                    'hillshade-highlight-color': 'rgb(255,250,220)',
+                    'hillshade-shadow-color': 'rgb(80,85,95)',
+                    'hillshade-accent-color': 'rgb(210,200,180)',
+                    'hillshade-illumination-direction': 315,
+                    'hillshade-illumination-anchor': 'viewport'
+                }
+            };
+        }
+
+        /**
+         * Update info panel description based on current theme
+         */
+        function updateInfoDescription(theme) {
+            const infoDesc = document.getElementById('info-description');
+            if (!infoDesc) return;
+
+            const descriptions = {
+                'contour': 'Terrarium 標高タイルから動的に等高線を生成',
+                'gsi': 'Mapterhorn の標高データと国土地理院の基盤地図を表示',
+                'gsi-ortho': 'Mapterhorn の標高データと国土地理院のシームレス写真を表示',
+                'lineage': '地形に対応した Lineage 画像タイルを表示',
+                'multidirectional': '複数の光源方向による多重光源陰影を表示',
+                'osm': 'Mapterhorn Terrarium 形式で標高データを可視化'
+            };
+
+            infoDesc.textContent = descriptions[theme] || descriptions['osm'];
+        }
+
+        /**
+         * Create terrain source configuration
+         */
+        function createTerrainSource(terrainTiles) {
+            return {
+                type: 'raster-dem',
+                tiles: terrainTiles,
+                encoding: 'terrarium',
+                tileSize: 512,
+                minzoom: 0,
+                maxzoom: 16
+            };
+        }
+
+        /**
+         * Build the style object based on theme
+         */
+        async function buildStyle(theme, exaggeration) {
+            // Fetch TileJSON from Mapterhorn
+            let terrainTiles;
+            try {
+                const response = await fetch(MAPTERHORN_TILEJSON_URL);
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch Mapterhorn TileJSON: ${response.status}`);
+                }
+                const tileJson = await response.json();
+                terrainTiles = tileJson.tiles;
+            } catch (error) {
+                console.error('Error fetching Mapterhorn TileJSON:', error);
+                // Fallback to default tile URL pattern
+                terrainTiles = ['https://tiles.mapterhorn.com/{z}/{x}/{y}'];
+            }
+
+            const style = {
+                version: 8,
+                glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+                sources: {
+                    terrainSource: createTerrainSource(terrainTiles),
+                    // Separate source for hillshade layers to avoid using the same
+                    // source object for both 3D terrain and hillshade rendering.
+                    // Using two sources (even pointing to the same tiles) improves
+                    // rendering quality and avoids MapLibre warnings.
+                    hillshadeSource: createTerrainSource(terrainTiles)
+                },
+                layers: [],
+                terrain: {
+                    source: 'terrainSource',
+                    exaggeration: exaggeration
+                }
+            };
+
+            // Add theme-specific sources and layers
+            if (theme === 'osm') {
+                return buildOsmStyle(style);
+            } else if (theme === 'gsi') {
+                return buildGsiStyle(style);
+            } else if (theme === 'gsi-ortho') {
+                return buildGsiOrthoStyle(style);
+            } else if (theme === 'contour') {
+                return buildContourStyle(style, terrainTiles[0]);
+            } else if (theme === 'multidirectional') {
+                return buildMultidirectionalStyle(style);
+            } else if (theme === 'lineage') {
+                // For lineage theme, we'll use the same terrain tiles for imagery
+                style.sources.lineage = {
+                    type: 'raster',
+                    tiles: terrainTiles,
+                    tileSize: 512,
+                    maxzoom: 16
+                };
+
+                style.layers = [
+                    getBackgroundLayer(),
+                    {
+                        id: 'lineage',
+                        type: 'raster',
+                        source: 'lineage',
+                        paint: {
+                            'raster-opacity': 1.0
+                        }
+                    },
+                    getHillshadeLayer()
+                ];
+
+                style.sky = getDefaultSkyConfig();
+
+                return style;
+            }
+
+            // Default to osm
+            return buildOsmStyle(style);
+        }
+
+        /**
+         * Multidirectional hillshade theme style
+         */
+        function buildMultidirectionalStyle(style) {
+            // Single hillshade layer using MapLibre's 'multidirectional' method.
+            // This uses the original color arrays and parameters that were
+            // present before the 'Vivid' preset was applied.
+            style.layers = [
+                getBackgroundLayer(),
+                {
+                    id: 'multidirectional-hillshade',
+                    type: 'hillshade',
+                    source: 'hillshadeSource',
+                    paint: {
+                        'hillshade-method': 'multidirectional',
+                        'hillshade-highlight-color': ['#FF4000', '#FFFF00', '#40ff00', '#00FF80'],
+                        'hillshade-shadow-color': ['#00bfff', '#0000ff', '#bf00ff', '#FF0080'],
+                        'hillshade-illumination-direction': [270, 315, 0, 45],
+                        'hillshade-illumination-altitude': [30, 30, 30, 30],
+                        'hillshade-exaggeration': 0.3,
+                        'hillshade-illumination-anchor': 'viewport'
+                    }
+                }
+            ];
+
+            style.sky = getDefaultSkyConfig();
+
+            return style;
+        }
+
+        /**
+         * OSM theme style (reproduces osm.html)
+         */
+        function buildOsmStyle(style) {
+            style.sources.osm = {
+                type: 'raster',
+                tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                tileSize: 256,
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                maxzoom: 19
+            };
+
+            style.layers = [
+                getBackgroundLayer(),
+                {
+                    id: 'osm',
+                    type: 'raster',
+                    source: 'osm',
+                    paint: {
+                        'raster-opacity': 0.7
+                    }
+                },
+                getHillshadeLayer()
+            ];
+
+            style.sky = getDefaultSkyConfig();
+
+            return style;
+        }
+
+        /**
+         * GSI theme style (reproduces index.html with bvmap)
+         */
+        async function buildGsiStyle(style) {
+            // 1) 既存の terrain/hillshade は維持
+            // 2) bvmap-overdrive の std.json を取得し、sources/layers を取り込む
+
+            // ベクトルタイルソース（MLT）: bvmap-overdrive を使用
+            style.sources['bvmap-overdrive'] = {
+                type: 'vector',
+                minzoom: 4,
+                maxzoom: 16,
+                tiles: ['https://tunnel.optgeo.org/martin/bvmap-overdrive/{z}/{x}/{y}'],
+                attribution: '国土地理院最適化ベクトルタイル(MLT; 標準地図風スタイル)',
+                encoding: 'mlt'
+            };
+
+            // 背景レイヤは std.json の定義があればそれを優先（なければ既定背景）
+            let mergedLayers = [];
+
+            let std;
+            // Try fetching std.json from the project's GitHub Pages (preferred),
+            // then fall back to raw.githubusercontent if Pages is not available.
+            const pagesStdUrl = 'https://optgeo.github.io/bvmap-overdrive/std.json';
+            const rawStdUrl = 'https://raw.githubusercontent.com/optgeo/bvmap-overdrive/main/docs/std.json';
+            try {
+                // Track which URL we actually used to load std.json for debugging
+                let usedStdUrl = pagesStdUrl;
+                let resp = await fetch(pagesStdUrl, { cache: 'no-cache' });
+                if (!resp.ok) {
+                    // Try raw.githubusercontent as a fallback
+                    console.warn(`std.json: GitHub Pages fetch failed (${resp.status}), falling back to raw.githubusercontent`);
+                    resp = await fetch(rawStdUrl, { cache: 'no-cache' });
+                    usedStdUrl = rawStdUrl;
+                }
+                if (!resp.ok) throw new Error(`fetch std.json failed: ${resp.status}`);
+                std = await resp.json();
+                // Debug: report which std.json URL was used
+                console.log(`std.json loaded from: ${usedStdUrl}`);
+            } catch (e) {
+                console.error('std.json の取得に失敗:', e);
+                // フォールバック: 薄い GSI 風に戻す
+                mergedLayers.push(getGsiHillshadeLayer());
+                style.layers = mergedLayers;
+                style.sky = getDefaultSkyConfig();
+                return style;
+            }
+
+            // std.json の sources 解析: ベクトルで bvmap-overdrive を指すソースを 'bvmap-overdrive' へ集約
+            const sourceAliasToBvmapOverdrive = new Set();
+            if (std.sources) {
+                for (const [key, src] of Object.entries(std.sources)) {
+                    if (src && src.type === 'vector') {
+                        const url = src.url || src.tiles && src.tiles[0] || '';
+                        if (typeof url === 'string' && url.includes('bvmap-overdrive')) {
+                            sourceAliasToBvmapOverdrive.add(key);
+                        }
+                    }
+                }
+            }
+
+            // sprite/glyphs が定義されていれば取り込み（既存 glyphs より優先）
+            if (std.sprite) {
+                style.sprite = std.sprite;
+            }
+            if (std.glyphs) {
+                style.glyphs = std.glyphs;
+            }
+
+            // レイヤ取り込み。まず std.json の background を先頭に配置（存在すれば）。
+            // つづいて AdmArea（行政区画）レイヤの直後に hillshade を挿入する。
+            let hillshadeInserted = false;
+            let backgroundInserted = false;
+
+            const existingIds = new Set(mergedLayers.map(l => l.id));
+            if (Array.isArray(std.layers)) {
+                for (const lyr of std.layers) {
+                    // 背景レイヤ検出: type が background のものを先頭に一度だけ挿入
+                    if (!backgroundInserted && lyr.type === 'background') {
+                        if (!lyr.id || !existingIds.has(lyr.id)) {
+                            mergedLayers.push(lyr);
+                            if (lyr.id) existingIds.add(lyr.id);
+                        }
+                        backgroundInserted = true;
+                        continue;
+                    }
+                    // terrain/hillshade を壊さないため、source が 'terrainSource'/'hillshadeSource' のものはスキップ。
+                    if (lyr.source === 'terrainSource' || lyr.source === 'hillshadeSource') continue;
+                    // bvmap-overdrive を指す別名ソースは 'bvmap-overdrive' に付け替え、それ以外の未知ソースはスキップ。
+                    if (lyr.source && lyr.source !== 'bvmap-overdrive') {
+                        if (sourceAliasToBvmapOverdrive.has(lyr.source)) {
+                            lyr.source = 'bvmap-overdrive';
+                        } else {
+                            continue;
+                        }
+                    }
+                    // 背景は既に追加済みなのでスキップ（重複回避）。
+                    if (lyr.id === 'background') continue;
+                    // 重複 ID のレイヤはスキップ。
+                    if (lyr.id && existingIds.has(lyr.id)) continue;
+
+                    mergedLayers.push(lyr);
+                    if (lyr.id) existingIds.add(lyr.id);
+                    if (!hillshadeInserted && (lyr.id === '行政区画' || lyr['source-layer'] === 'AdmArea')) {
+                        mergedLayers.push(getGsiHillshadeLayer());
+                        hillshadeInserted = true;
+                    }
+                }
+            }
+
+            // フォールバック: AdmArea が見つからなければ背景直後に hillshade を挿入
+            if (!hillshadeInserted) {
+                // 背景が未挿入なら既定背景を先頭に追加
+                if (!backgroundInserted) {
+                    mergedLayers.unshift(getBackgroundLayer());
+                }
+                const bgIndex = mergedLayers.findIndex(l => l.type === 'background');
+                const insertPos = bgIndex >= 0 ? bgIndex + 1 : 1;
+                mergedLayers.splice(insertPos, 0, getGsiHillshadeLayer());
+            } else if (!backgroundInserted) {
+                // 背景がまだなければ既定背景を先頭に追加
+                mergedLayers.unshift(getBackgroundLayer());
+            }
+
+            style.layers = mergedLayers;
+            style.sky = getDefaultSkyConfig();
+            return style;
+        }
+
+        /**
+         * GSI Ortho theme style (seamlessphoto)
+         */
+        function buildGsiOrthoStyle(style) {
+            style.sources['gsi-ortho'] = {
+                type: 'raster',
+                tiles: ['https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg'],
+                tileSize: 256,
+                attribution: '&copy; <a href="https://www.gsi.go.jp/" target="_blank" rel="noopener noreferrer">国土地理院</a>',
+                maxzoom: 18
+            };
+
+            style.layers = [
+                getBackgroundLayer(),
+                {
+                    id: 'gsi-ortho',
+                    type: 'raster',
+                    source: 'gsi-ortho',
+                    paint: {
+                        'raster-opacity': 1.0
+                    }
+                },
+                getHillshadeLayer()
+            ];
+
+            style.sky = getDefaultSkyConfig();
+
+            return style;
+        }
+
+        /**
+         * Contour theme style (reproduces contour.html)
+         */
+        function buildContourStyle(style, terrainTileUrl) {
+            // Setup DEM source for contour generation
+            const demSource = new mlcontour.DemSource({
+                url: terrainTileUrl,
+                encoding: 'terrarium',
+                tileSize: 512,
+                maxzoom: 16,
+                worker: true
+            });
+            demSource.setupMaplibre(maplibregl);
+
+            style.sources.contourSource = {
+                type: 'vector',
+                tiles: [
+                    demSource.contourProtocolUrl({
+                        thresholds: {
+                            11: [50, 500],
+                            12: [20, 200],
+                            13: [10, 100],
+                            14: [5, 50],
+                            15: [2, 20],
+                            16: [1, 10]
+                        },
+                        elevationKey: 'ele',
+                        levelKey: 'level',
+                        contourLayer: 'contours',
+                        buffer: 4,
+                        overzoom: 2
+                    })
+                ],
+                maxzoom: 17
+            };
+
+            style.layers = [
+                getBackgroundLayer(),
+                getGsiHillshadeLayer(),
+                {
+                    id: 'contours',
+                    type: 'line',
+                    source: 'contourSource',
+                    'source-layer': 'contours',
+                    paint: {
+                        'line-color': 'rgb(215,151,60)',
+                        'line-width': [
+                            'interpolate', ['linear'], ['zoom'],
+                            11, ['match', ['get', 'level'], 1, 0.8, 0.4],
+                            14, ['match', ['get', 'level'], 1, 1.2, 0.6],
+                            16, ['match', ['get', 'level'], 1, 1.5, 0.7]
+                        ],
+                        'line-opacity': 0.95
+                    },
+                    layout: {
+                        'line-cap': 'round',
+                        'line-join': 'round'
+                    }
+                }
+            ];
+
+            return style;
+        }
+
+        /**
+         * Parse map hash (z/lat/lng/pitch/bearing) from URL
+         */
+        function parseMapHash(mapParam) {
+            if (!mapParam) return null;
+            
+            const parts = mapParam.split('/');
+            if (parts.length < 3) return null;
+
+            const result = {
+                zoom: parseFloat(parts[0]),
+                center: [parseFloat(parts[2]), parseFloat(parts[1])]
+            };
+
+            if (parts.length >= 4) {
+                result.pitch = parseFloat(parts[3]);
+            }
+            if (parts.length >= 5) {
+                result.bearing = parseFloat(parts[4]);
+            }
+
+            return result;
+        }
+
+        /**
+         * Format map position to hash string
+         */
+        function formatMapHash(zoom, center, pitch, bearing) {
+            const z = zoom.toFixed(2);
+            const lat = center.lat.toFixed(5);
+            const lng = center.lng.toFixed(5);
+            const p = pitch.toFixed(1);
+            const b = bearing.toFixed(0);
+            return `${z}/${lat}/${lng}/${p}/${b}`;
+        }
+
+        // Initialize map
+        async function initMap() {
+            const style = await buildStyle(theme, exag);
+
+            // Parse initial map position from hash
+            const mapPosition = parseMapHash(hashParams.map);
+
+            const mapOptions = {
+                container: 'map',
+                style: style,
+                maxPitch: 85,
+                projection: 'globe'
+            };
+
+            // Set initial position from hash or default
+            if (mapPosition) {
+                mapOptions.zoom = mapPosition.zoom;
+                mapOptions.center = mapPosition.center;
+                if (mapPosition.pitch !== undefined) {
+                    mapOptions.pitch = mapPosition.pitch;
+                }
+                if (mapPosition.bearing !== undefined) {
+                    mapOptions.bearing = mapPosition.bearing;
+                }
+            } else {
+                // Default position (same as original fusite)
+                mapOptions.zoom = 14.74;
+                mapOptions.center = [129.87255, 32.75055];
+                mapOptions.pitch = 16.2;
+                mapOptions.bearing = 6;
+            }
+
+            map = new maplibregl.Map(mapOptions);
+
+            // Add navigation controls
+            map.addControl(new maplibregl.NavigationControl({
+                visualizePitch: true,
+                showZoom: true,
+                showCompass: true
+            }), 'top-right');
+
+            // Add scale control
+            map.addControl(new maplibregl.ScaleControl({
+                maxWidth: 200,
+                unit: 'metric'
+            }), 'bottom-right');
+
+            // Add fullscreen control
+            map.addControl(new maplibregl.FullscreenControl(), 'top-right');
+
+            // Add geolocate control
+            map.addControl(new maplibregl.GeolocateControl({
+                positionOptions: {
+                    enableHighAccuracy: true
+                },
+                trackUserLocation: true
+            }), 'top-right');
+
+            // Add native Globe control
+            map.addControl(new maplibregl.GlobeControl(), 'top-right');
+
+            // Custom Terrain Exaggeration Control
+            class TerrainExaggerationControl {
+                constructor(initialValue) {
+                    this._initialValue = initialValue;
+                }
+
+                onAdd(map) {
+                    this._map = map;
+                    this._container = document.createElement('div');
+                    this._container.className = 'maplibregl-ctrl terrain-ctrl';
+                    this._container.innerHTML = `
+                        <div class="terrain-exaggeration">
+                            <label for="terrain-slider">地形強調: <span id="terrain-value">${this._initialValue.toFixed(1)}</span>x</label>
+                            <input type="range" id="terrain-slider" min="0" max="3" step="0.1" value="${this._initialValue}">
+                        </div>
+                    `;
+
+                    const slider = this._container.querySelector('#terrain-slider');
+                    const valueDisplay = this._container.querySelector('#terrain-value');
+
+                    slider.oninput = (e) => {
+                        const value = parseFloat(e.target.value);
+                        valueDisplay.textContent = value.toFixed(1);
+                        map.setTerrain({
+                            source: 'terrainSource',
+                            exaggeration: value
+                        });
+                        // Update URL with new exaggeration value
+                        updateHashParams({
+                            exag: value.toFixed(1)
+                        });
+                    };
+
+                    return this._container;
+                }
+
+                onRemove() {
+                    this._container.parentNode.removeChild(this._container);
+                    this._map = undefined;
+                }
+            }
+
+            // Add Terrain Exaggeration control
+            map.addControl(new TerrainExaggerationControl(exag), 'bottom-left');
+
+            // Helper function to get current exaggeration from slider
+            function getCurrentExaggeration() {
+                const slider = document.getElementById('terrain-slider');
+                return slider ? parseFloat(slider.value) : exag;
+            }
+
+            // Update hash when map moves (using 'map' key as specified)
+            map.on('moveend', () => {
+                const center = map.getCenter();
+                const zoom = map.getZoom();
+                const pitch = map.getPitch();
+                const bearing = map.getBearing();
+                const currentExag = getCurrentExaggeration();
+                
+                updateHashParams({
+                    map: formatMapHash(zoom, center, pitch, bearing),
+                    theme: theme,
+                    exag: currentExag.toFixed(1)
+                });
+            });
+
+            // Add GSI attribution on load
+            map.on('load', () => {
+                console.log(`Map loaded with theme: ${theme}, exag: ${exag}`);
+
+                const attributionControl = document.querySelector('.maplibregl-ctrl-attrib-inner');
+                if (attributionControl && !attributionControl.innerHTML.includes('国土地理院')) {
+                    attributionControl.innerHTML += ' | データ: <a href="https://www.gsi.go.jp/" target="_blank" rel="noopener noreferrer">国土地理院 (GSI Japan)</a> R 7JHs 542';
+                }
+
+                // Update info panel description based on theme
+                updateInfoDescription(theme);
+
+                // Set initial hash if not already set
+                if (!hashParams.map) {
+                    const center = map.getCenter();
+                    const zoom = map.getZoom();
+                    const pitch = map.getPitch();
+                    const bearing = map.getBearing();
+                    const currentExag = getCurrentExaggeration();
+                    
+                    updateHashParams({
+                        map: formatMapHash(zoom, center, pitch, bearing),
+                        theme: theme,
+                        exag: currentExag.toFixed(1)
+                    });
+                }
+            });
+
+            map.on('error', (e) => {
+                console.error('Map error:', e);
+            });
+        }
+
+        // Info panel toggle
+        const toggleBtn = document.getElementById('info-toggle');
+        const infoPanel = document.getElementById('info-panel');
+        const updateToggleUi = () => {
+            const isOpen = !infoPanel.classList.contains('hidden');
+            toggleBtn.setAttribute('aria-expanded', String(isOpen));
+            infoPanel.setAttribute('aria-hidden', String(!isOpen));
+            toggleBtn.textContent = isOpen ? '×' : 'ℹ️';
+            toggleBtn.title = isOpen ? '情報を閉じる' : '情報を開く';
+        };
+        toggleBtn.addEventListener('click', () => {
+            infoPanel.classList.toggle('hidden');
+            updateToggleUi();
+        });
+        updateToggleUi();
+
+        // Initialize dropdowns with current values
+        const themeSelect = document.getElementById('theme-select');
+        
+        themeSelect.value = theme;
+
+        /**
+         * Update URL fragment and apply changes without full reload.
+         * This updates the hash (via history.replaceState) and then
+         * rebuilds/applies the map style so theme changes take effect
+         * immediately.
+         */
+        async function updateAndApply(newTheme) {
+            // Update hash parameters
+            updateHashParams({
+                theme: newTheme
+            });
+
+            // Re-parse and apply to map
+            await applyHashParamsToMap();
+        }
+
+        /**
+         * Read the current hash params and apply the theme/exag to the map
+         * without performing a full page reload. This will rebuild the style and
+         * call `map.setStyle` so MapLibre updates visuals accordingly.
+         */
+        async function applyHashParamsToMap() {
+            if (!map) return;
+
+            hashParams = parseHashParams();
+            theme = hashParams.theme || theme;
+            exag = parseFloat(hashParams.exag) || exag;
+
+            // Update dropdown UI to reflect current params
+            if (typeof themeSelect !== 'undefined' && themeSelect) themeSelect.value = theme;
+
+            // Build and apply new style.
+            // Note: `map.setStyle` replaces the current style (sources and
+            // layers). UI controls added via `map.addControl` are usually
+            // retained by MapLibre, but style-specific resources (sources,
+            // layers) are reconstructed. This approach avoids a full page
+            // reload while ensuring the visual style updates to the new
+            // `theme` settings.
+            const style = await buildStyle(theme, exag);
+            map.setStyle(style);
+
+            // Update info description to reflect new theme immediately
+            updateInfoDescription(theme);
+        }
+
+        // Event handlers for dropdown changes: update fragment and apply without reload
+        themeSelect.addEventListener('change', (e) => {
+            updateAndApply(e.target.value);
+        });
+
+        // Also respond to external hash changes (e.g., user pasted URL)
+        window.addEventListener('hashchange', () => {
+            applyHashParamsToMap();
+        });
+
+        // Initialize the map
+        initMap();
+    </script>
+</body>
+
+</html>

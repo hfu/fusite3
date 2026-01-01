@@ -254,7 +254,7 @@
         /**
          * Multidirectional hillshade theme style
          */
-        function buildMultidirectionalStyle(style) {
+        async function buildMultidirectionalStyle(style) {
             // Single hillshade layer using MapLibre's 'multidirectional' method.
             // This uses the original color arrays and parameters that were
             // present before the 'Vivid' preset was applied.
@@ -275,6 +275,66 @@
                     }
                 }
             ];
+
+            // Add optimized vector tiles (bvmap-overdrive) as a source so we can
+            // render place name labels on top of the hillshade. This mirrors the
+            // approach used in buildGsiStyle to avoid missing source references.
+            style.sources['bvmap-overdrive'] = {
+                type: 'vector',
+                minzoom: 4,
+                maxzoom: 16,
+                tiles: ['https://tunnel.optgeo.org/martin/bvmap-overdrive/{z}/{x}/{y}'],
+                attribution: '国土地理院最適化ベクトルタイル(MLT; 標準地図風スタイル)',
+                encoding: 'mlt'
+            };
+
+            // Try to fetch std.json and extract symbol (label) layers that
+            // reference bvmap-overdrive. If fetching fails, continue silently
+            // without labels.
+            try {
+                const pagesStdUrl = 'https://optgeo.github.io/bvmap-overdrive/std.json';
+                const rawStdUrl = 'https://raw.githubusercontent.com/optgeo/bvmap-overdrive/main/docs/std.json';
+                let resp = await fetch(pagesStdUrl, { cache: 'no-cache' });
+                if (!resp.ok) resp = await fetch(rawStdUrl, { cache: 'no-cache' });
+                if (resp.ok) {
+                    const std = await resp.json();
+                    // Apply sprite/glyphs if present
+                    if (std.sprite) style.sprite = std.sprite;
+                    if (std.glyphs) style.glyphs = std.glyphs;
+
+                    // Determine which source keys in std.json point to bvmap-overdrive
+                    const sourceAliasToBvmapOverdrive = new Set();
+                    if (std.sources) {
+                        for (const [key, src] of Object.entries(std.sources)) {
+                            if (src && src.type === 'vector') {
+                                const url = src.url || (src.tiles && src.tiles[0]) || '';
+                                if (typeof url === 'string' && url.includes('bvmap-overdrive')) {
+                                    sourceAliasToBvmapOverdrive.add(key);
+                                }
+                            }
+                        }
+                    }
+
+                    const existingIds = new Set(style.layers.map(l => l.id));
+                    if (Array.isArray(std.layers)) {
+                        for (const lyr of std.layers) {
+                            if (lyr.type !== 'symbol') continue;
+                            if (!lyr.source) continue;
+                            if (lyr.source !== 'bvmap-overdrive' && !sourceAliasToBvmapOverdrive.has(lyr.source)) continue;
+                            // Avoid terrain/hillshade conflicts
+                            if (lyr.source === 'terrainSource' || lyr.source === 'hillshadeSource') continue;
+                            // Clone layer, remap source to 'bvmap-overdrive'
+                            const clone = JSON.parse(JSON.stringify(lyr));
+                            clone.source = 'bvmap-overdrive';
+                            if (clone.id && existingIds.has(clone.id)) continue;
+                            style.layers.push(clone);
+                            if (clone.id) existingIds.add(clone.id);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('多重光源: std.json の取得に失敗しました。ラベルは追加されませんでした。', e);
+            }
 
             style.sky = getDefaultSkyConfig();
 
@@ -397,9 +457,9 @@
                         backgroundInserted = true;
                         continue;
                     }
-                    // terrain/hillshade を壊さないため、source が 'terrainSource'/'hillshadeSource' のものはスキップ。
+                    // terrain/hillshade を壊さないため、source が 'terrainSource'/'hillshadeSource' のものはスキップ
                     if (lyr.source === 'terrainSource' || lyr.source === 'hillshadeSource') continue;
-                    // bvmap-overdrive を指す別名ソースは 'bvmap-overdrive' に付け替え、それ以外の未知ソースはスキップ。
+                    // bvmap-overdrive を指す別名ソースは 'bvmap-overdrive' に付け替え、それ以外の未知ソースはスキップ
                     if (lyr.source && lyr.source !== 'bvmap-overdrive') {
                         if (sourceAliasToBvmapOverdrive.has(lyr.source)) {
                             lyr.source = 'bvmap-overdrive';
@@ -407,9 +467,9 @@
                             continue;
                         }
                     }
-                    // 背景は既に追加済みなのでスキップ（重複回避）。
+                    // 背景は既に追加済みなのでスキップ（重複回避）
                     if (lyr.id === 'background') continue;
-                    // 重複 ID のレイヤはスキップ。
+                    // 重複 ID のレイヤはスキップ
                     if (lyr.id && existingIds.has(lyr.id)) continue;
 
                     mergedLayers.push(lyr);
@@ -443,7 +503,7 @@
         /**
          * GSI Ortho theme style (seamlessphoto)
          */
-        function buildGsiOrthoStyle(style) {
+        async function buildGsiOrthoStyle(style) {
             style.sources['gsi-ortho'] = {
                 type: 'raster',
                 tiles: ['https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg'],
@@ -466,6 +526,69 @@
             ];
 
             style.sky = getDefaultSkyConfig();
+
+            // Add optimized vector tiles (bvmap-overdrive) to overlay place name labels
+            style.sources['bvmap-overdrive'] = {
+                type: 'vector',
+                minzoom: 4,
+                maxzoom: 16,
+                tiles: ['https://tunnel.optgeo.org/martin/bvmap-overdrive/{z}/{x}/{y}'],
+                attribution: '国土地理院最適化ベクトルタイル(MLT; 標準地図風スタイル)',
+                encoding: 'mlt'
+            };
+
+            // Attempt to fetch std.json and pull over only symbol (label) layers
+            try {
+                const pagesStdUrl = 'https://optgeo.github.io/bvmap-overdrive/std.json';
+                const rawStdUrl = 'https://raw.githubusercontent.com/optgeo/bvmap-overdrive/main/docs/std.json';
+                let resp = await fetch(pagesStdUrl, { cache: 'no-cache' });
+                if (!resp.ok) resp = await fetch(rawStdUrl, { cache: 'no-cache' });
+                if (resp.ok) {
+                    const std = await resp.json();
+                    if (std.sprite) style.sprite = std.sprite;
+                    if (std.glyphs) style.glyphs = std.glyphs;
+
+                    const sourceAliasToBvmapOverdrive = new Set();
+                    if (std.sources) {
+                        for (const [key, src] of Object.entries(std.sources)) {
+                            if (src && src.type === 'vector') {
+                                const url = src.url || (src.tiles && src.tiles[0]) || '';
+                                if (typeof url === 'string' && url.includes('bvmap-overdrive')) {
+                                    sourceAliasToBvmapOverdrive.add(key);
+                                }
+                            }
+                        }
+                    }
+
+                    const existingIds = new Set(style.layers.map(l => l.id));
+                    if (Array.isArray(std.layers)) {
+                        // 縦書きフォント対応: text-writing-mode が vertical のレイヤに縦書きフォントを適用
+                        std.layers.forEach(lyr => {
+                            if (lyr.type === 'symbol' && lyr.layout && lyr.layout['text-writing-mode'] === 'vertical') {
+                                if (lyr.layout['text-font'] && Array.isArray(lyr.layout['text-font'])) {
+                                    lyr.layout['text-font'].unshift('Noto Sans CJK JP Regular');
+                                } else {
+                                    lyr.layout['text-font'] = ['Noto Sans CJK JP Regular'];
+                                }
+                            }
+                        });
+                        
+                        for (const lyr of std.layers) {
+                            if (lyr.type !== 'symbol') continue;
+                            if (!lyr.source) continue;
+                            if (lyr.source !== 'bvmap-overdrive' && !sourceAliasToBvmapOverdrive.has(lyr.source)) continue;
+                            if (lyr.source === 'terrainSource' || lyr.source === 'hillshadeSource') continue;
+                            const clone = JSON.parse(JSON.stringify(lyr));
+                            clone.source = 'bvmap-overdrive';
+                            if (clone.id && existingIds.has(clone.id)) continue;
+                            style.layers.push(clone);
+                            if (clone.id) existingIds.add(clone.id);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn('シームレス写真: std.json の取得に失敗しました。ラベルは追加されませんでした。', e);
+            }
 
             return style;
         }
@@ -581,7 +704,8 @@
                 container: 'map',
                 style: style,
                 maxPitch: 85,
-                projection: 'globe'
+                projection: 'globe',
+                localIdeographFontFamily: 'sans-serif'
             };
 
             // Set initial position from hash or default
